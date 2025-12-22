@@ -7,7 +7,7 @@
 #define DHTTYPE DHT22
 
 const char *ssid = "Cyber Surge";
-const char *mqttServer = "192.168.1.100"; // Local broker IP or cloud address
+const char *mqttServer = "192.168.1.100";
 const char *password = "cout<<INTERNETpassword";
 
 WiFiClient espClient;
