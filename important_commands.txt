@@ -1,0 +1,5 @@
+to run the broker
+mosquitto_sub -h <ip of broker>  -u <name of user> -P <password of user> -t "home/air/<user name>/#" -v
+
+to run the serial monitor
+pio device monitor -p COM<number> -b 115200
