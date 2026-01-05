@@ -1,12 +1,17 @@
 # iot_frontend.py
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import time, json, queue, threading
+import time
+import json
+import queue
 from collections import deque
 import paho.mqtt.client as mqtt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import csv
+import re
+import math
+import socket
 
 # ---------- CONFIG DEFAULTS ----------
 DEFAULT_BROKER = "172.16.18.157"
@@ -18,11 +23,14 @@ MAX_POINTS = 600   # keep last N points for plotting (~600)
 POLL_MS = 200      # GUI poll interval
 # --------------------------------------
 
+
 class IoTFrontend:
     def __init__(self, root):
         self.root = root
         root.title("Air Sensor Dashboard")
         self.msg_q = queue.Queue()
+
+        # MQTT client and state
         self.mqtt_client = None
         self.connected = False
 
@@ -75,7 +83,7 @@ class IoTFrontend:
         self.pass_e.grid(row=2, column=3, sticky="w")
 
         btn_frame = ttk.Frame(conn)
-        btn_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6,0))
+        btn_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         self.connect_btn = ttk.Button(btn_frame, text="Connect", command=self.toggle_connect)
         self.connect_btn.pack(side="left")
         ttk.Button(btn_frame, text="Export CSV", command=self.export_csv).pack(side="left", padx=6)
@@ -102,13 +110,13 @@ class IoTFrontend:
         self.gas_val.grid(row=2, column=1, sticky="w", padx=6)
 
         # Log (compact)
-        self.log = tk.Text(frm, height=6, state="disabled", font=("Consolas", 10))
-        self.log.grid(row=2, column=0, sticky="nsew", padx=4, pady=(4,0))
+        self.log = tk.Text(frm, height=8, state="disabled", font=("Consolas", 10))
+        self.log.grid(row=2, column=0, sticky="nsew", padx=4, pady=(4, 0))
         frm.rowconfigure(2, weight=0)
 
     def _build_plot(self):
         # Plot area below
-        self.fig = Figure(figsize=(8,3), dpi=100)
+        self.fig = Figure(figsize=(8, 3), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_title("Last values (seconds)")
         self.ax.set_xlabel("Time (s ago)")
@@ -117,6 +125,7 @@ class IoTFrontend:
         self.canvas.get_tk_widget().grid(row=3, column=0, sticky="nsew", padx=8, pady=8)
         self.root.rowconfigure(3, weight=1)
 
+    # ---------------- MQTT lifecycle ----------------
     def toggle_connect(self):
         if self.mqtt_client and self.connected:
             self._disconnect()
@@ -127,7 +136,7 @@ class IoTFrontend:
         host = self.host_e.get().strip()
         try:
             port = int(self.port_e.get().strip())
-        except:
+        except Exception:
             messagebox.showerror("Bad port", "Port must be integer")
             return
         topic = self.topic_e.get().strip()
@@ -135,7 +144,23 @@ class IoTFrontend:
             messagebox.showerror("Missing settings", "Host and Topic required")
             return
 
-        client = mqtt.Client()
+        # If there's already a client object, don't create a new one (avoid GC)
+        if self.mqtt_client:
+            # attempt clean reconnect
+            try:
+                self.mqtt_client.disconnect()
+            except:
+                pass
+            try:
+                self.mqtt_client.loop_stop()
+            except:
+                pass
+            self.mqtt_client = None
+            self.connected = False
+
+        client_id = f"iot-frontend-{int(time.time())}"
+        client = mqtt.Client(client_id=client_id, clean_session=True)
+
         user = self.user_e.get().strip()
         pwd = self.pass_e.get()
         if user:
@@ -144,38 +169,59 @@ class IoTFrontend:
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
         client.on_message = self._on_message
+        client.on_log = lambda cl, ud, level, buf: self.msg_q.put(("__LOG__", f"MQTT log [{level}]: {buf}", time.time()))
+
+        # make connect non-blocking in sense that we call connect() and loop_start()
         try:
             client.connect(host, port, keepalive=60)
         except Exception as e:
+            self.msg_q.put(("__SYS__", f"CONNECT FAILED: {e}", time.time()))
             messagebox.showerror("Connect failed", f"{e}")
             return
-        client.loop_start()
+
+        try:
+            client.loop_start()
+        except Exception as e:
+            self.msg_q.put(("__SYS__", f"LOOP_START FAILED: {e}", time.time()))
+            messagebox.showerror("MQTT loop failed", f"{e}")
+            return
+
         self.mqtt_client = client
         self.status_label.config(text="Connecting...", foreground="orange")
         self.connect_btn.config(text="Disconnect")
+        self.msg_q.put(("__SYS__", "CONNECT_ISSUED", time.time()))
 
     def _disconnect(self):
         if self.mqtt_client:
             try:
-                self.mqtt_client.disconnect()
                 self.mqtt_client.loop_stop()
+            except:
+                pass
+            try:
+                self.mqtt_client.disconnect()
             except:
                 pass
         self.mqtt_client = None
         self.connected = False
         self.status_label.config(text="Disconnected", foreground="red")
         self.connect_btn.config(text="Connect")
+        self.msg_q.put(("__SYS__", "DISCONNECTED", time.time()))
 
     # MQTT callbacks
     def _on_connect(self, client, userdata, flags, rc):
         topic = self.topic_e.get().strip()
-        try:
-            client.subscribe(topic)
-            self.msg_q.put(("__SYS__", f"SUBSCRIBED {topic}", time.time()))
-        except Exception as e:
-            self.msg_q.put(("__SYS__", f"SUBSCRIBE FAILED {e}", time.time()))
-        self.msg_q.put(("__SYS__", "CONNECTED", time.time()))
-        self.connected = True
+        if rc == 0:
+            try:
+                client.subscribe(topic)
+                self.msg_q.put(("__SYS__", f"SUBSCRIBED {topic}", time.time()))
+            except Exception as e:
+                self.msg_q.put(("__SYS__", f"SUBSCRIBE FAILED {e}", time.time()))
+            self.msg_q.put(("__SYS__", "CONNECTED", time.time()))
+            self.connected = True
+        else:
+            # rc values: 1=refused, bad protocol version; 2=identifier rejected; 3=server unavailable; 4=bad username/pass; 5=not authorized
+            self.msg_q.put(("__SYS__", f"CONNECT FAILED rc={rc}", time.time()))
+            self.connected = False
 
     def _on_disconnect(self, client, userdata, rc):
         self.msg_q.put(("__SYS__", "DISCONNECTED", time.time()))
@@ -184,11 +230,12 @@ class IoTFrontend:
     def _on_message(self, client, userdata, msg):
         ts = time.time()
         try:
-            payload = msg.payload.decode('utf-8', errors='replace')
-        except:
+            payload = msg.payload.decode("utf-8", errors="replace")
+        except Exception:
             payload = str(msg.payload)
         self.msg_q.put((msg.topic, payload, ts))
 
+    # ----------------- GUI queue processing -----------------
     def _poll_queue(self):
         updated = False
         while True:
@@ -196,56 +243,100 @@ class IoTFrontend:
                 topic, payload, ts = self.msg_q.get_nowait()
             except queue.Empty:
                 break
+
             if topic == "__SYS__":
                 self._append_log(ts, "SYS", payload)
+                # interpret a few system tokens
                 if payload == "CONNECTED":
                     self.status_label.config(text="Connected", foreground="green")
+                elif payload.startswith("CONNECT FAILED"):
+                    self.status_label.config(text="Connect failed", foreground="red")
                 elif payload == "DISCONNECTED":
                     self.status_label.config(text="Disconnected", foreground="red")
                 updated = True
                 continue
 
-            # normal message
+            if topic == "__LOG__":
+                self._append_log(ts, "MQTT-LOG", payload)
+                updated = True
+                continue
+
+            # Normal message
             self._append_log(ts, topic, payload)
             self.raw_log.append((ts, topic, payload))
-            # parse JSON
+
+            # parse JSON but tolerate non-standard constants like nan / inf emitted by the ESP
+            obj = None
             try:
                 obj = json.loads(payload)
-            except:
-                obj = None
+            except Exception:
+                # sanitize common non-standard constants (nan, inf, Infinity) -> null so json.loads can parse
+                # This targets values after ':' and before ',' or '}'.
+                payload_sanitized = re.sub(r'(?<=:)\s*([-+]?(?:nan|inf|infinity))(?=[,}])', ' null', payload, flags=re.I)
+                try:
+                    obj = json.loads(payload_sanitized)
+                except Exception:
+                    obj = None
 
             if isinstance(obj, dict):
-                # update display values and buffers
+                # temperature
                 if "temperature" in obj:
-                    try:
-                        t = float(obj["temperature"])
-                        self.temp_val.config(text=f"{t:.1f} °C")
-                        self.temp_buf.append((ts, t))
-                    except:
-                        pass
+                    tv = obj.get("temperature")
+                    if tv is None:
+                        self.temp_val.config(text="—")
+                    else:
+                        try:
+                            t = float(tv)
+                            if math.isnan(t):
+                                self.temp_val.config(text="—")
+                            else:
+                                self.temp_val.config(text=f"{t:.1f} °C")
+                                self.temp_buf.append((ts, t))
+                        except Exception:
+                            self.temp_val.config(text="—")
+
+                # humidity
                 if "humidity" in obj:
-                    try:
-                        h = float(obj["humidity"])
-                        self.hum_val.config(text=f"{h:.1f} %")
-                        self.hum_buf.append((ts, h))
-                    except:
-                        pass
+                    hv = obj.get("humidity")
+                    if hv is None:
+                        self.hum_val.config(text="—")
+                    else:
+                        try:
+                            h = float(hv)
+                            if math.isnan(h):
+                                self.hum_val.config(text="—")
+                            else:
+                                self.hum_val.config(text=f"{h:.1f} %")
+                                self.hum_buf.append((ts, h))
+                        except Exception:
+                            self.hum_val.config(text="—")
+
+                # gas_raw
                 if "gas_raw" in obj:
-                    try:
-                        g = float(obj["gas_raw"])
-                        self.gas_val.config(text=f"{g:.0f}")
-                        self.gas_buf.append((ts, g))
-                    except:
-                        pass
+                    gv = obj.get("gas_raw")
+                    if gv is None:
+                        self.gas_val.config(text="—")
+                    else:
+                        try:
+                            g = float(gv)
+                            if math.isnan(g):
+                                self.gas_val.config(text="—")
+                            else:
+                                self.gas_val.config(text=f"{int(round(g))}")
+                                self.gas_buf.append((ts, g))
+                        except Exception:
+                            self.gas_val.config(text="—")
+
+                updated = True
             else:
-                # not JSON -- ignore for plotting but keep in log
-                pass
-            updated = True
+                # not JSON — nothing to parse for plotting
+                updated = True
 
         if updated:
             self._update_plot()
         self.root.after(POLL_MS, self._poll_queue)
 
+    # ----------------- UI helpers -----------------
     def _append_log(self, ts, topic, payload):
         timestr = time.strftime("%H:%M:%S", time.localtime(ts))
         line = f"[{timestr}] {topic}: {payload}\n"
@@ -257,7 +348,7 @@ class IoTFrontend:
     def _update_plot(self):
         # We'll plot time relative to now (seconds ago)
         now = time.time()
-        # prepare series
+
         def series_to_xy(buf):
             if not buf:
                 return [], []
@@ -270,7 +361,8 @@ class IoTFrontend:
         gx, gy = series_to_xy(self.gas_buf)
 
         self.ax.cla()
-        self.ax.invert_xaxis()  # show newest at right? invert to show 0 on right
+        # show newest at right by inverting x-axis (0 at right)
+        self.ax.invert_xaxis()
         if ty:
             self.ax.plot(tx, ty, label="Temp (°C)")
         if hy:
@@ -304,8 +396,16 @@ class IoTFrontend:
                         temp = obj.get("temperature", "")
                         hum = obj.get("humidity", "")
                         gas = obj.get("gas_raw", "")
-                    except:
-                        pass
+                    except Exception:
+                        # try sanitized parse
+                        payload_sanitized = re.sub(r'(?<=:)\s*([-+]?(?:nan|inf|infinity))(?=[,}])', ' null', payload, flags=re.I)
+                        try:
+                            obj = json.loads(payload_sanitized)
+                            temp = obj.get("temperature", "")
+                            hum = obj.get("humidity", "")
+                            gas = obj.get("gas_raw", "")
+                        except Exception:
+                            pass
                     w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)), topic, payload, temp, hum, gas])
             messagebox.showinfo("Exported", f"Saved to {fn}")
         except Exception as e:
@@ -325,8 +425,15 @@ class IoTFrontend:
         self._update_plot()
 
     def _on_close(self):
-        self._disconnect()
+        # clean disconnect
+        try:
+            if self.mqtt_client:
+                self.mqtt_client.loop_stop()
+                self.mqtt_client.disconnect()
+        except:
+            pass
         self.root.destroy()
+
 
 if __name__ == "__main__":
     root = tk.Tk()

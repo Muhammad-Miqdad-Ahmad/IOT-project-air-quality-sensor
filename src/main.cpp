@@ -8,10 +8,12 @@
 
 // const char *ssid = "Cyber Surge";
 // const char *wifiPassword = "cout<<INTERNETpassword";
-const char *ssid = "Faculty-ITU";
-const char *wifiPassword = "faculty@itu1234*";
+// const char *ssid = "Faculty";
+// const char *wifiPassword = "faculty@itu1234*";
+const char *ssid = "IBRAHIM.";
+const char *wifiPassword = "ibrahim185a";
 
-const char *mqttServer = "172.16.18.157";
+const char *mqttServer = "192.168.100.122";
 const uint16_t mqttPort = 1883;
 
 const char *mqttUser = "esp01";
