@@ -1,133 +1,107 @@
-#include <DHT.h>
-#include <WiFi.h>
-#include <PubSubClient.h>
+/*
+  ESP32 SENSOR TEST (no WiFi)
+  - Reads DHT22 on DHTPIN
+  - Reads MQ analog on MQPIN (averages several samples)
+  - Prints raw + voltage + simple status to Serial
 
-#define MQPIN 0
-#define DHTPIN 2
-#define DHTTYPE DHT22
+  IMPORTANT:
+  - If your MQ module is powered from 5V, DO NOT connect the module analog output
+    directly to the ESP32 ADC pin (ESP32 ADC is not 5V tolerant). Power the MQ
+    module with 3.3V or use a proper voltage divider/level-shifter on the analog
+    output.
+  - Change MQPIN to match the ADC-capable pin you wired.
+*/
 
-// --- CONFIG: change the WiFi password below ---
-const char *ssid = "IBRAHIM.";
-const char *wifiPassword = "ibrahim185a"; // <- replace with your WiFi password
+// #include <DHT.h>
 
-// MQTT server (your Mosquitto box)
-const char *mqttServer = "192.168.100.14";
-const uint16_t mqttPort = 1883;
+// #define DHTPIN 2        // DHT data pin (change if needed)
+// #define DHTTYPE DHT22
 
-// MQTT credentials (you said "pass" is the password for any user)
-const char *mqttUser = "esp01";   // using "esp01" to match your ACL
-const char *mqttPassword = "pass";
+// // Change this to the ADC pin you're using. 34 is ADC1_CH6 on many ESP32 boards.
+// #define MQPIN 0
 
-// Topic that matches your ACL: esp01 can write under home/air/esp01/#
-const char *mqttTopic = "home/air/esp01/data";
+// DHT dht(DHTPIN, DHTTYPE);
 
-WiFiClient espClient;
-PubSubClient client(espClient);
-DHT dht(DHTPIN, DHTTYPE);
+// unsigned long lastDhtRead = 0;
+// const unsigned long dhtInterval = 2500UL; // DHT22 needs ~2s between reads
 
-unsigned long lastPublish = 0;
-const unsigned long publishInterval = 60UL * 1000UL; // 60 seconds
+// void setup() {
+//   Serial.begin(115200);
+//   while (!Serial) { delay(10); } // wait for serial on some boards
+//   Serial.println();
+//   Serial.println("=== ESP32 SENSOR TEST (no WiFi) ===");
 
-void setupWifi() {
-  Serial.print("Connecting to WiFi ");
-  Serial.print(ssid);
-  WiFi.begin(ssid, wifiPassword);
+//   dht.begin();
 
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(250);
-    Serial.print(".");
-    // avoid locking forever: print status every 10s
-    if (millis() - start > 20000UL) {
-      Serial.println();
-      Serial.println("Still trying to connect to WiFi...");
-      start = millis();
-    }
-  }
-  Serial.println();
-  Serial.print("Connected. IP: ");
-  Serial.println(WiFi.localIP());
-}
+//   // Optional: ensure ADC resolution is 12-bit (0..4095)
+//   analogReadResolution(12);
 
-bool mqttReconnect() {
-  if (WiFi.status() != WL_CONNECTED) return false;
+//   // If you want you can set attenuation to read wider range (optional)
+//   // analogSetPinAttenuation(MQPIN, ADC_11db); // uncomment if you understand attenuation
 
-  Serial.print("Connecting to MQTT as ");
-  Serial.print(mqttUser);
-  Serial.print(" ...");
+//   Serial.print("DHT pin: "); Serial.println(DHTPIN);
+//   Serial.print("MQ analog pin: "); Serial.println(MQPIN);
+//   Serial.println("Start reading...");
+// }
 
-  // Use clientId unique if you want; here we keep it simple.
-  String clientId = String("esp01-") + String((uint32_t)millis()); // basic unique-ish id
-  if (client.connect(clientId.c_str(), mqttUser, mqttPassword)) {
-    Serial.println("connected");
-    // You may publish an "online" retained message if desired:
-    client.publish("home/air/esp01/status", "online", true);
-    return true;
-  } else {
-    Serial.print("failed, rc=");
-    Serial.print(client.state());
-    Serial.println(" -> retrying in 5s");
-    return false;
-  }
-}
+// float readMqAverage(int samples = 10, int delayMs = 10) {
+//   long sum = 0;
+//   for (int i = 0; i < samples; ++i) {
+//     int r = analogRead(MQPIN);
+//     sum += r;
+//     delay(delayMs);
+//   }
+//   return sum / (float)samples;
+// }
 
-void setup() {
-  Serial.begin(115200);
-  dht.begin();
+// void loop() {
+//   unsigned long now = millis();
 
-  setupWifi();
+//   // Read DHT every ~2.5s
+//   if (now - lastDhtRead >= dhtInterval) {
+//     lastDhtRead = now;
 
-  client.setServer(mqttServer, mqttPort);
-}
+//     float humidity = dht.readHumidity();
+//     float tempC = dht.readTemperature();
+//     float tempF = dht.readTemperature(true);
 
-void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected. Reconnecting...");
-    setupWifi();
-    delay(500);
-  }
+//     Serial.println("----------------------------------");
+//     Serial.print("Millis: "); Serial.println(now);
 
-  // Reconnect MQTT if needed
-  if (!client.connected()) {
-    if (!mqttReconnect()) {
-      delay(5000); // pause before next reconnect attempt
-      return;
-    }
-  }
-  client.loop();
+//     if (isnan(humidity) || isnan(tempC)) {
+//       Serial.println("DHT22: Failed to read sensor!");
+//     } else {
+//       Serial.print("DHT22 Temperature: ");
+//       Serial.print(tempC, 1);
+//       Serial.print(" °C  (");
+//       Serial.print(tempF, 1);
+//       Serial.println(" °F)");
 
-  // Publish at interval
-  if (millis() - lastPublish >= publishInterval) {
-    lastPublish = millis();
+//       Serial.print("DHT22 Humidity: ");
+//       Serial.print(humidity, 1);
+//       Serial.println(" %");
+//     }
 
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
-    int mqValue = 0;
-    for (size_t i = 0; i < 10; i++)
-    {
-      mqValue += analogRead(MQPIN);;
-    }
-    mqValue /= 10;
-    
+//     // Read MQ analog (average)
+//     float mqRaw = readMqAverage(12, 10); // 12 samples, 10ms apart
+//     // Convert raw ADC (0..4095 at 12-bit) to voltage (assuming 3.3V reference)
+//     float voltage = mqRaw * (3.3f / 4095.0f);
 
-    if (isnan(h) || isnan(t)) {
-      Serial.println("Failed to read from DHT sensor");
-    }
+//     Serial.print("MQ raw (avg): ");
+//     Serial.print(mqRaw, 1);
+//     Serial.print("  |  Voltage: ");
+//     Serial.print(voltage, 3);
+//     Serial.println(" V");
 
-    // Build JSON payload
-    String payload = "{";
-    payload += "\"temperature\":" + String(t, 1) + ",";
-    payload += "\"humidity\":" + String(h, 1) + ",";
-    payload += "\"gas_raw\":" + String(mqValue);
-    payload += "}";
+//     // A very rough "relative" level (0..100) — not a calibrated ppm
+//     float rel = (mqRaw / 4095.0f) * 100.0f;
+//     Serial.print("MQ relative level: ");
+//     Serial.print(rel, 1);
+//     Serial.println(" %");
 
-    Serial.print("Publishing to ");
-    Serial.print(mqttTopic);
-    Serial.print(": ");
-    Serial.println(payload);
+//     Serial.println();
+//   }
 
-    bool ok = client.publish(mqttTopic, payload.c_str());
-    Serial.print("Publish ");
-    Serial.println(ok ? "OK" : "FAILED");
-  }
-}
+//   // small idle delay so loop doesn't hog CPU
+//   delay(50);
+// }
