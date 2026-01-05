@@ -89,3 +89,4 @@ credentials.h
 /release/
 *.bin.gz
 
+/frontend/iotFrontend

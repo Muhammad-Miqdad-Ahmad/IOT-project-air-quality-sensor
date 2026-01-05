@@ -3,3 +3,6 @@ mosquitto_sub -h <ip of broker>  -u <name of user> -P <password of user> -t "hom
 
 to run the serial monitor
 pio device monitor -p COM<number> -b 115200
+
+ip -br a
+to check the ip

@@ -2,14 +2,16 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-#define MQPIN 0
+#define MQPIN 3
 #define DHTPIN 2
 #define DHTTYPE DHT11
 
-const char *ssid = "Cyber Surge";
-const char *wifiPassword = "cout<<INTERNETpassword";
+// const char *ssid = "Cyber Surge";
+// const char *wifiPassword = "cout<<INTERNETpassword";
+const char *ssid = "Faculty-ITU";
+const char *wifiPassword = "faculty@itu1234*";
 
-const char *mqttServer = "192.168.100.14";
+const char *mqttServer = "172.16.18.157";
 const uint16_t mqttPort = 1883;
 
 const char *mqttUser = "esp01";
@@ -22,7 +24,7 @@ PubSubClient client(espClient);
 DHT dht(DHTPIN, DHTTYPE);
 
 unsigned long lastPublish = 0;
-const unsigned long publishInterval = 60UL * 1000UL; // 60 seconds
+const unsigned long publishInterval = 10UL * 1000UL; // 60 seconds
 
 void setupWifi() {
   Serial.print("Connecting to WiFi ");
