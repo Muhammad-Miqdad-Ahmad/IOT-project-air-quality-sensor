@@ -1,4 +1,4 @@
-# ESP32 Air Sensor (MQ + DHT) → Mosquitto Broker → Python Frontend — **Part 1 of 2**
+# ESP32 Air Sensor (MQ + DHT) → Mosquitto Broker → Python Frontend
 
 > **Short:** ESP32 reads a DHT11 (temperature + humidity) and an MQ-series gas sensor, publishes JSON to a Mosquitto MQTT broker (I ran the broker on both Ubuntu and Arch Linux). A Python/Tkinter frontend subscribes, plots values, and can export CSV.
 > This is **part 1** (repo layout, hardware, firmware & PlatformIO details, payload format, and important gotchas). I’ll deliver part 2 (broker setup, frontend, testing, troubleshooting, security, improvements, license & credits) in the next message.

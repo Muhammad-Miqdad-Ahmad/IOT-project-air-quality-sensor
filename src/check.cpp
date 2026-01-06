@@ -105,3 +105,63 @@
 //   // small idle delay so loop doesn't hog CPU
 //   delay(50);
 // }
+
+
+// #include <DHT.h>
+
+// #define DHTPIN 21        // change if your data line is on a different pin
+// #define DHTTYPE DHT11   // or DHT22 if that's what you have
+
+// DHT dht(DHTPIN, DHTTYPE);
+
+// unsigned long lastRead = 0;
+// const unsigned long READ_INTERVAL = 2000UL; // DHT requires >=1s between reads; 2s is safe
+// int failCount = 0;
+
+// void setup() {
+//   Serial.begin(115200);
+//   delay(100); // let serial settle
+//   Serial.println();
+//   Serial.println("=== DHT sensor test ===");
+//   Serial.print("Pin: "); Serial.println(DHTPIN);
+//   Serial.print("Type: "); Serial.println(DHTTYPE == DHT11 ? "DHT11" : "DHT22/AM2302");
+//   dht.begin();
+// }
+
+// void loop() {
+//   if (millis() - lastRead < READ_INTERVAL) return;
+//   lastRead = millis();
+
+//   Serial.println();
+//   Serial.print("Reading... (failCount=");
+//   Serial.print(failCount);
+//   Serial.println(")");
+
+//   float h = dht.readHumidity();
+//   float tC = dht.readTemperature();        // Celsius
+//   float tF = dht.readTemperature(true);    // Fahrenheit
+
+//   // Check for failed read
+//   if (isnan(h) || isnan(tC) || isnan(tF)) {
+//     failCount++;
+//     Serial.println("ERROR: Failed to read from DHT sensor (NaN).");
+//     Serial.println("Hints: check wiring, power, pull-up resistor, and correct sensor type.");
+//   } else {
+//     failCount = 0; // reset on success
+//     Serial.print("Temperature: ");
+//     Serial.print(tC, 1);
+//     Serial.print(" °C  (");
+//     Serial.print(tF, 1);
+//     Serial.println(" °F)");
+
+//     Serial.print("Humidity: ");
+//     Serial.print(h, 1);
+//     Serial.println(" %");
+
+//     // Optional: compute heat index (C)
+//     float heatIndexC = dht.computeHeatIndex(tC, h, false);
+//     Serial.print("Heat index (approx): ");
+//     Serial.print(heatIndexC, 1);
+//     Serial.println(" °C");
+//   }
+// }

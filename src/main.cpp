@@ -6,12 +6,12 @@
 #define DHTPIN 2
 #define DHTTYPE DHT11
 
-// const char *ssid = "Cyber Surge";
-// const char *wifiPassword = "cout<<INTERNETpassword";
+const char *ssid = "Cyber Surge";
+const char *wifiPassword = "cout<<INTERNETpassword";
 // const char *ssid = "Faculty";
 // const char *wifiPassword = "faculty@itu1234*";
-const char *ssid = "IBRAHIM.";
-const char *wifiPassword = "ibrahim185a";
+// const char *ssid = "IBRAHIM.";
+// const char *wifiPassword = "ibrahim185a";
 
 const char *mqttServer = "192.168.100.122";
 const uint16_t mqttPort = 1883;
