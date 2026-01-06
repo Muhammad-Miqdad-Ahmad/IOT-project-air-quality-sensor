@@ -8,23 +8,20 @@
 # Repo layout (suggested)
 
 ```
-README-part1.md
-README-part2.md
-esp/                      # PlatformIO project for the ESP firmware
+src/main.cpp              # PlatformIO project for the ESP firmware
 frontend/                 # Python frontend + helper scripts
 frontend/requirements.txt
-frontend/setup_and_run.py # helper that creates venv and runs frontend
+frontend/makeEnv.py       # helper that creates venv and installs dependencies
+frontend/IOTfrontend.py   # The front end for the broker made using tkinter
 scripts/add_mqtt_device.sh # helper for Mosquitto user + ACL (optional)
 LICENSE
 ```
-
-Place the PlatformIO project under `esp/` and the frontend under `frontend/`. Split README into two files (or keep them as README.md with sections) — here they are split per your request.
 
 ---
 
 # Hardware
 
-* **ESP** — ESP32 (recommended). ESP8266 could work but requires code/pin changes.
+* **ESP** — ESP32 (recommended). ESP8266 could work but requires code/pin changes. I used the ESP32-C3 Super mini
 * **DHT sensor** — DHT11 in the code; DHT22 recommended if you want better accuracy.
 * **MQ-series gas sensor** — e.g., MQ-2 / MQ-135 (analog output).
 * USB cable for power + serial.
@@ -37,11 +34,6 @@ Place the PlatformIO project under `esp/` and the frontend under `frontend/`. Sp
 
 **Important pin note (ESP32)**
 Do **not** use ADC2 pins when Wi-Fi is used — ADC2 is shared with Wi-Fi. Prefer ADC1 pins (GPIO32–GPIO39) for stable analog reads. Also avoid pins that affect flash/boot unless you know what you’re doing.
-
-**Recommended example pins (ESP32)**
-
-* `DHTPIN = 2` (GPIO2)
-* `MQPIN = 34` (GPIO34, ADC1) — change the sketch accordingly.
 
 ---
 
@@ -70,18 +62,23 @@ platformio device monitor -b 115200
 ## Example `platformio.ini` (put in `esp/platformio.ini`)
 
 ```ini
-[env:esp32dev]
+[env:esp32-c3-devkitm-1]
 platform = espressif32
-board = esp32dev
+board = esp32-c3-devkitm-1
 framework = arduino
+
 monitor_speed = 115200
+monitor_filters = esp32_exception_decoder
+build_flags =
+  -DARDUINO_USB_MODE=1
+  -DARDUINO_USB_CDC_ON_BOOT=1
 
 lib_deps =
-  adafruit/Adafruit Unified Sensor@^1.1.4
+  adafruit/Adafruit Unified Sensor@^1.1.9
   adafruit/DHT sensor library@^1.4.3
   knolleary/PubSubClient@^2.8
+  bblanchon/ArduinoJson@^6.21.0
 
-; upload_port = /dev/ttyUSB0  ; set if you want to force a port
 ```
 
 Notes:
@@ -121,24 +118,6 @@ Example payload the ESP publishes:
 
 ---
 
-# Important code notes & gotchas
-
-* **MQ analog pin:** The sample sketch used `MQPIN = 3` — that is not a good default for ESP32. Change `MQPIN` to an ADC1 pin (e.g., 34) to avoid serial/Wi-Fi conflicts.
-* **Averaging:** The sketch averages 10 samples for `analogRead()` to stabilize the gas reading — keep or increase sample count for smoother values.
-* **DHT failures:** `DHT.readTemperature()` and `DHT.readHumidity()` may return `NaN`. The sketch logs and skips bad readings. Avoid reading DHTs faster than once every 2 seconds.
-* **publishInterval discrepancy:** In the code you pasted, `publishInterval = 10UL * 1000UL` (10 seconds) but a comment said 60s — confirm the interval you want and update the comment or value.
-* **MQTT client IDs:** The sketch forms a client id using `millis()` which is okay for uniqueness during dev; for production, consider a deterministic unique ID per device (MAC-based or a flashed ID).
-* **Retained status:** The sketch publishes a retained `online` message (`home/air/esp01/status`) — this is useful so new subscribers know the device last known state. If you prefer not to use retained messages, change the publish flag.
-* **client.state():** When `client.connect()` fails, the sketch prints `client.state()` — use that return code to debug auth failures or protocol issues.
-* **Power & noisy ADC:** MQ sensors (and their heaters) draw current and generate noise. Ensure stable power supply (capable of heater current) and consider filtering the analog input (hardware RC filter) or using shielded wiring for reliable readings.
-* **ADC calibration:** Raw ADC values are not PPM. Convert to real gas concentrations via calibration curves if you need meaningful units.
-
-# ESP32 Air Sensor (MQ + DHT) → Mosquitto Broker → Python Frontend — **Part 2 of 2** (Markdown)
-
-> **This is Part 2** — continues from Part 1. Contains broker setup (Ubuntu/Arch), `add_mqtt_device.sh`, Python frontend install & run, testing, troubleshooting, security, improvements, license & contribution, and credits.
-
----
-
 # MQTT broker setup (Mosquitto)
 
 > Replace example IPs / usernames / passwords with secure values for production.
@@ -158,7 +137,7 @@ sudo mosquitto_passwd -c /etc/mosquitto/passwd esp01
 # enter password when prompted (example: pass)
 ```
 
-Create `/etc/mosquitto/conf.d/esp.conf`:
+Create `/etc/mosquitto/conf.d/local.conf`:
 
 ```
 listener 1883 0.0.0.0
@@ -171,7 +150,6 @@ Restart and open firewall (if using `ufw`):
 
 ```bash
 sudo systemctl restart mosquitto
-sudo ufw allow 1883/tcp
 ```
 
 Test from a client machine:
@@ -184,7 +162,7 @@ mosquitto_sub -h <broker-ip> -t home/air/esp01/data -u esp01 -P pass -v
 
 ```bash
 sudo pacman -Syu
-sudo pacman -S mosquitto mosquitto-clients
+sudo pacman -S mosquitto
 sudo systemctl enable --now mosquitto.service
 ```
 
@@ -216,7 +194,7 @@ ss -ltnp | grep 1883
 
 This helper adds a Mosquitto user and ACL entry for `home/air/<device>/#`.
 
-**Script (naive append version)**
+**Script**
 
 ```bash
 #!/usr/bin/env bash
@@ -258,17 +236,6 @@ chmod +x add_mqtt_device.sh
 ./add_mqtt_device.sh esp01
 ```
 
-**Idempotency note**
-The script appends ACL blocks naively. If you run it twice for the same device you'll create duplicate ACL entries. If you want an idempotent variant, replace the append step with logic that checks for an existing `user <device>` line and edits or skips if present. Example (simple guard):
-
-```bash
-if sudo grep -q "^user $DEVICE\$" "$ACL_FILE"; then
-  echo "ACL entry already exists for $DEVICE, skipping ACL append"
-else
-  # append block ...
-fi
-```
-
 ---
 
 # Frontend (Python / Tkinter)
@@ -300,10 +267,10 @@ pip install -r requirements.txt
 python iot_frontend.py
 ```
 
-Or run your helper script (example `setup_and_run.py`):
+Or run your helper script (example `makeEnv.py`):
 
 ```bash
-python3 setup_and_run.py
+python3 makeEnv.py
 ```
 
 ## Using the GUI
@@ -392,37 +359,6 @@ python3 setup_and_run.py
 
 ---
 
-# Security & production notes
-
-* **Do not** use plaintext credentials for public or internet-exposed brokers.
-* Consider TLS (MQTT over TLS on 8883) and certificate-based auth.
-* Use strong, unique passwords per device.
-* Lock down the broker firewall to allowed IPs only.
-* Rotate credentials and monitor logs for suspicious activity.
-* For large fleets, use a more robust identity and provisioning process (e.g., certificate-per-device).
-
----
-
-# Improvements / TODOs
-
-* Add MQTT over TLS (broker and ESP). PlatformIO/Esp32 support `WiFiClientSecure` + PubSubClient or use `MQTTClient` supporting TLS.
-* Convert `gas_raw` ADC to PPM via calibration curves for targeted gases.
-* Add OTA updates for ESP (PlatformIO + ArduinoOTA or native ESP OTA).
-* Use persistent storage + time-series DB (InfluxDB) + Grafana dashboards.
-* Harden `add_mqtt_device.sh` to be idempotent and support bulk device registration.
-* Add unit tests / linter (shellcheck for scripts, flake8 for Python).
-* Add CI to build PlatformIO firmware automatically (example: GitHub Actions).
-
----
-
-# License
-
-Pick a license. For small projects MIT is recommended.
-
-**MIT (example)** — create `LICENSE` file with MIT text.
-
----
-
 # Contribution
 
 * PRs and issues welcome.
@@ -443,14 +379,6 @@ Pick a license. For small projects MIT is recommended.
 
 # Quick reference (commands)
 
-Build & upload via PlatformIO:
-
-```bash
-cd esp
-platformio run -e esp32dev -t upload
-platformio device monitor -b 115200
-```
-
 Start frontend (venv):
 
 ```bash
@@ -458,18 +386,18 @@ cd frontend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python iot_frontend.py
+python IOTfrontend.py
 ```
 
 Add device helper:
 
 ```bash
-chmod +x scripts/add_mqtt_device.sh
+chmod +x add_mqtt_device.sh
 ./scripts/add_mqtt_device.sh esp01
 ```
 
 Test subscribe (client):
 
 ```bash
-mosquitto_sub -h <broker-ip> -t "home/air/esp01/#" -u esp01 -P <password> -v
+mosquitto_sub -h <broker-ip> -t "home/air/<user name>/#" -u <user name> -P <password> -v
 ```
