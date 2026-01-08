@@ -554,11 +554,9 @@
 # iot_frontend.py
 """
 IoT frontend with dynamic local-IP detection and an editable Host combobox.
-Added: MQTT key shortcuts:
-  t -> temp increase (publish "INC:0.5")
-  T -> temp decrease (publish "DEC:0.5")
-  h -> hum  increase (publish "HUM_INC:1")
-  H -> hum  decrease (publish "HUM_DEC:1")
+Kept: MQTT key shortcuts (t/T/h/H) that publish to DEFAULT_CMD_TOPIC.
+Removed from UI: Cmd topic entry (functionality still present).
+Suppressed: successful command publish messages from appearing in the Tkinter log.
 """
 
 import tkinter as tk
@@ -582,7 +580,7 @@ import fcntl
 DEFAULT_BROKER = "172.16.18.157"
 DEFAULT_PORT = 1883
 DEFAULT_TOPIC = "home/air/esp01/data"
-DEFAULT_CMD_TOPIC = "home/air/esp01/cmd"
+DEFAULT_CMD_TOPIC = "home/air/esp01/cmd"   # change here if you want a different cmd topic
 DEFAULT_USER = "esp01"
 DEFAULT_PASS = "pass"
 MAX_POINTS = 600   # keep last N points for plotting (~600)
@@ -644,7 +642,6 @@ def get_all_ipv4_addresses():
         p = subprocess.run(['ip', '-4', '-o', 'addr', 'show'],
                            capture_output=True, text=True, check=False, timeout=1.0)
         out = p.stdout or ""
-        # lines format: "2: wlp2s0    inet 192.168.1.34/24 ..."
         entries = re.findall(r'^\d+:\s+([^:]+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/', out, flags=re.M)
         result = []
         for iface, ip in entries:
@@ -661,7 +658,6 @@ def detect_local_ip_dynamic(preferred_iface='wlan0'):
     Tries preferred interface first (ioctl, ip cmd), otherwise scans all interfaces and returns first non-loopback.
     Returns tuple (ip, source) where source is a short string describing how it was found.
     """
-    # 1) try ioctl on preferred iface
     try:
         ip = _get_ip_ioctl(preferred_iface)
         if ip:
@@ -669,23 +665,18 @@ def detect_local_ip_dynamic(preferred_iface='wlan0'):
     except Exception:
         pass
 
-    # 2) try ip command on preferred iface
     ip = _get_ip_from_ip_cmd(preferred_iface)
     if ip:
         return ip, f"ipcmd:{preferred_iface}"
 
-    # 3) scan all ipv4 addresses
     entries = get_all_ipv4_addresses()
     if entries:
-        # prefer preferred iface if present in list
         for iface, addr in entries:
             if iface == preferred_iface:
                 return addr, f"scan:{iface}"
-        # otherwise first non-loopback
         iface, addr = entries[0]
         return addr, f"scan:{iface}"
 
-    # 4) outbound socket fallback
     ip = _get_ip_via_socket()
     if ip:
         return ip, "socket:getter"
@@ -710,6 +701,9 @@ class IoTFrontend:
         self.gas_buf = deque(maxlen=MAX_POINTS)
         self.raw_log = []
 
+        # command topic kept internal (no UI control shown)
+        self.cmd_topic = DEFAULT_CMD_TOPIC
+
         self._build_ui()
         self._build_plot()
 
@@ -727,16 +721,14 @@ class IoTFrontend:
 
         conn = ttk.LabelFrame(frm, text="Broker / Subscription")
         conn.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
-        # allow more columns to accommodate combobox + refresh button + status
         for i in range(6):
             conn.columnconfigure(i, weight=1 if i == 1 else 0)
 
         ttk.Label(conn, text="Host:").grid(row=0, column=0, sticky="w")
-        # get all detected addresses
         entries = get_all_ipv4_addresses()  # list of (iface, ip)
         detected_ips = [ip for (_, ip) in entries]
 
-        # Host is now an editable Combobox pre-filled with detected IPs and default fallback
+        # Host editable Combobox pre-filled with detected IPs and default fallback
         self.host_e = ttk.Combobox(conn, values=detected_ips, state='normal', width=20)
         detected_ip, source = detect_local_ip_dynamic(self.preferred_iface)
         if detected_ip:
@@ -762,10 +754,7 @@ class IoTFrontend:
         self.topic_e.insert(0, DEFAULT_TOPIC)
         self.topic_e.grid(row=1, column=1, columnspan=3, sticky="ew")
 
-        ttk.Label(conn, text="Cmd topic:").grid(row=1, column=4, sticky="w", padx=(6,0))
-        self.cmd_topic_e = ttk.Entry(conn, width=20)
-        self.cmd_topic_e.insert(0, DEFAULT_CMD_TOPIC)
-        self.cmd_topic_e.grid(row=1, column=5, sticky="w")
+        # NOTE: Cmd topic UI removed (functionality retained via self.cmd_topic)
 
         ttk.Label(conn, text="User:").grid(row=2, column=0, sticky="w")
         self.user_e = ttk.Entry(conn)
@@ -808,7 +797,6 @@ class IoTFrontend:
     def _refresh_ips(self):
         entries = get_all_ipv4_addresses()
         detected_ips = [ip for (_, ip) in entries]
-        # update combobox values while keeping current text
         cur = self.host_e.get()
         self.host_e['values'] = detected_ips
         if not cur and detected_ips:
@@ -903,7 +891,6 @@ class IoTFrontend:
         self.connect_btn.config(text="Connect")
         self.msg_q.put(("__SYS__", "DISCONNECTED", time.time()))
 
-    # MQTT callbacks and remaining methods unchanged (same as before)
     def _on_connect(self, client, userdata, flags, rc):
         topic = self.topic_e.get().strip()
         if rc == 0:
@@ -940,39 +927,35 @@ class IoTFrontend:
         if not ch:
             return  # ignore non-character keys
 
-        # map keys to command strings and human-readable desc
-        cmd_topic = self.cmd_topic_e.get().strip() or DEFAULT_CMD_TOPIC
+        # use internal cmd_topic (no UI)
+        cmd_topic = self.cmd_topic or DEFAULT_CMD_TOPIC
 
         if ch == 't':  # increase temperature
             cmd = f"INC:{TEMP_STEP}"
-            desc = f"Temp +{TEMP_STEP}"
         elif ch == 'T':  # decrease temperature
             cmd = f"DEC:{TEMP_STEP}"
-            desc = f"Temp -{TEMP_STEP}"
         elif ch == 'h':  # increase humidity
             cmd = f"HUM_INC:{HUM_STEP}"
-            desc = f"Hum +{HUM_STEP}"
         elif ch == 'H':  # decrease humidity
             cmd = f"HUM_DEC:{HUM_STEP}"
-            desc = f"Hum -{HUM_STEP}"
         else:
             return  # not a key we care about
 
-        # publish
+        # publish; do NOT append a success log to the GUI (suppressed as requested)
         ok = self._publish_cmd(cmd_topic, cmd)
-        self._append_log(time.time(), "CMD", f"{desc} -> {cmd} ({'sent' if ok else 'not sent'})")
+        if not ok:
+            # only show a warning if publish failed or we're disconnected
+            self._append_log(time.time(), "WARN", "Command not sent (disconnected or publish error)")
 
     def _publish_cmd(self, topic, payload):
         if not self.mqtt_client or not self.connected:
-            # give user a small feedback
-            self._append_log(time.time(), "WARN", "Not connected - command not sent")
+            # small feedback to user (but not verbose success message)
             return False
         try:
-            # publish fire-and-forget
-            res = self.mqtt_client.publish(topic, payload)
-            # res is MQTTMessageInfo; don't block — log mid if present
+            self.mqtt_client.publish(topic, payload)
             return True
         except Exception as e:
+            # show error in GUI log
             self._append_log(time.time(), "ERR", f"Publish failed: {e}")
             return False
 
@@ -1000,6 +983,7 @@ class IoTFrontend:
                 updated = True
                 continue
 
+            # Received MQTT message — show it in log (but not command publishes)
             self._append_log(ts, topic, payload)
             self.raw_log.append((ts, topic, payload))
 
@@ -1014,6 +998,7 @@ class IoTFrontend:
                     obj = None
 
             if isinstance(obj, dict):
+                # only temperature, humidity, gas_raw are expected and handled
                 if "temperature" in obj:
                     tv = obj.get("temperature")
                     if tv is None:
