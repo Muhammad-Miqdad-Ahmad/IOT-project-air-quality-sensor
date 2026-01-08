@@ -782,7 +782,7 @@ void loop() {
     String payload = "{";
     payload += "\"temperature\":" + String(reportedTemp, 1) + ",";
     payload += "\"humidity\":" + String(reportedHum, 1) + ",";
-    payload += "\"gas_raw\":" + String(mqValue) + ",";
+    payload += "\"gas_raw\":" + String(mqValue);
     payload += "}";
 
     Serial.print("Publishing to ");
