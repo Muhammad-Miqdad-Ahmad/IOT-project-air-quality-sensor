@@ -1,6 +1,7 @@
 #include <DHT.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include "secrets.h"
 
 #if defined(ESP32)
   #include <esp_system.h> // for esp_random()
@@ -8,12 +9,12 @@
 
 #define MQPIN 3
 #define DHTPIN 2
-#define DHTTYPE DHT11
+#define DHTTYPE DHT22
 
-const char *wifiPassword = "library@itu1234*";
-const char *ssid = "ITU-Library";
+const char *ssid = wifi::ssid_home;
+const char *wifiPassword = wifi::wifiPassword_home;
 
-const char *mqttServer = "172.16.21.105";
+const char *mqttServer = "192.168.100.122";
 const uint16_t mqttPort = 1883;
 
 const char *mqttUser = "esp01";
@@ -28,7 +29,7 @@ PubSubClient client(espClient);
 DHT dht(DHTPIN, DHTTYPE);
 
 unsigned long lastPublish = 0;
-const unsigned long publishInterval = 10UL * 1000UL;
+const unsigned long publishInterval = 5UL * 1000UL;
 
 // Offsets applied to reported values (changed by MQTT commands)
 // These offsets are NOT published to MQTT anymore (only printed to Serial)
