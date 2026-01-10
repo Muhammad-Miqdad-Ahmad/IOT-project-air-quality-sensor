@@ -1,1152 +1,329 @@
-# #!/usr/bin/env python3
-# # iot_frontend.py
-# """
-# IoT frontend with dynamic local-IP detection and an editable Host combobox.
-# """
-
-# import tkinter as tk
-# from tkinter import ttk, filedialog, messagebox
-# import time
-# import json
-# import queue
-# from collections import deque
-# import paho.mqtt.client as mqtt
-# from matplotlib.figure import Figure
-# from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-# import csv
-# import re
-# import math
-# import socket
-# import subprocess
-# import struct
-# import fcntl
-
-# # ---------- CONFIG DEFAULTS ----------
-# DEFAULT_BROKER = "172.16.18.157"
-# DEFAULT_PORT = 1883
-# DEFAULT_TOPIC = "home/air/esp01/data"
-# DEFAULT_USER = "esp01"
-# DEFAULT_PASS = "pass"
-# MAX_POINTS = 600   # keep last N points for plotting (~600)
-# POLL_MS = 200      # GUI poll interval
-# # --------------------------------------
-
-
-# def _get_ip_ioctl(ifname: str):
-#     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-#     try:
-#         ifname_b = ifname[:15].encode('utf-8')
-#         packed = struct.pack('256s', ifname_b)
-#         res = fcntl.ioctl(s.fileno(), 0x8915, packed)  # SIOCGIFADDR
-#         ip = socket.inet_ntoa(res[20:24])
-#         return ip
-#     except Exception:
-#         return None
-#     finally:
-#         try:
-#             s.close()
-#         except Exception:
-#             pass
-
-
-# def _get_ip_from_ip_cmd(ifname: str):
-#     try:
-#         p = subprocess.run(['ip', '-4', 'addr', 'show', ifname],
-#                            capture_output=True, text=True, check=False, timeout=1.0)
-#         out = p.stdout or ""
-#         m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)/', out)
-#         if m:
-#             return m.group(1)
-#     except Exception:
-#         pass
-#     return None
-
-
-# def _get_ip_via_socket():
-#     try:
-#         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-#         s.connect(('8.8.8.8', 80))
-#         ip = s.getsockname()[0]
-#         s.close()
-#         return ip
-#     except Exception:
-#         return None
-
-
-# def get_all_ipv4_addresses():
-#     """
-#     Returns list of (iface, ip) tuples for all non-loopback IPv4 addresses.
-#     Parses: `ip -4 -o addr show`
-#     """
-#     try:
-#         p = subprocess.run(['ip', '-4', '-o', 'addr', 'show'],
-#                            capture_output=True, text=True, check=False, timeout=1.0)
-#         out = p.stdout or ""
-#         # lines format: "2: wlp2s0    inet 192.168.1.34/24 ..."
-#         entries = re.findall(r'^\d+:\s+([^:]+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/', out, flags=re.M)
-#         result = []
-#         for iface, ip in entries:
-#             if iface == 'lo':
-#                 continue
-#             result.append((iface, ip))
-#         return result
-#     except Exception:
-#         return []
-
-
-# def detect_local_ip_dynamic(preferred_iface='wlan0'):
-#     """
-#     Tries preferred interface first (ioctl, ip cmd), otherwise scans all interfaces and returns first non-loopback.
-#     Returns tuple (ip, source) where source is a short string describing how it was found.
-#     """
-#     # 1) try ioctl on preferred iface
-#     try:
-#         ip = _get_ip_ioctl(preferred_iface)
-#         if ip:
-#             return ip, f"ioctl:{preferred_iface}"
-#     except Exception:
-#         pass
-
-#     # 2) try ip command on preferred iface
-#     ip = _get_ip_from_ip_cmd(preferred_iface)
-#     if ip:
-#         return ip, f"ipcmd:{preferred_iface}"
-
-#     # 3) scan all ipv4 addresses
-#     entries = get_all_ipv4_addresses()
-#     if entries:
-#         # prefer preferred iface if present in list
-#         for iface, addr in entries:
-#             if iface == preferred_iface:
-#                 return addr, f"scan:{iface}"
-#         # otherwise first non-loopback
-#         iface, addr = entries[0]
-#         return addr, f"scan:{iface}"
-
-#     # 4) outbound socket fallback
-#     ip = _get_ip_via_socket()
-#     if ip:
-#         return ip, "socket:getter"
-
-#     return None, "none"
-
-
-# class IoTFrontend:
-#     def __init__(self, root, preferred_iface='wlan0'):
-#         self.root = root
-#         root.title("Air Sensor Dashboard")
-#         self.msg_q = queue.Queue()
-#         self.preferred_iface = preferred_iface
-
-#         # MQTT client and state
-#         self.mqtt_client = None
-#         self.connected = False
-
-#         # data buffers: deque of (ts, value)
-#         self.temp_buf = deque(maxlen=MAX_POINTS)
-#         self.hum_buf = deque(maxlen=MAX_POINTS)
-#         self.gas_buf = deque(maxlen=MAX_POINTS)
-#         self.raw_log = []
-
-#         self._build_ui()
-#         self._build_plot()
-
-#         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-#         self.root.after(POLL_MS, self._poll_queue)
-
-#     def _build_ui(self):
-#         frm = ttk.Frame(self.root, padding=8)
-#         frm.grid(sticky="nsew")
-#         self.root.columnconfigure(0, weight=1)
-#         self.root.rowconfigure(0, weight=1)
-
-#         conn = ttk.LabelFrame(frm, text="Broker / Subscription")
-#         conn.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
-#         # allow more columns to accommodate combobox + refresh button + status
-#         for i in range(6):
-#             conn.columnconfigure(i, weight=1 if i == 1 else 0)
-
-#         ttk.Label(conn, text="Host:").grid(row=0, column=0, sticky="w")
-#         # get all detected addresses
-#         entries = get_all_ipv4_addresses()  # list of (iface, ip)
-#         detected_ips = [ip for (_, ip) in entries]
-
-#         # Host is now an editable Combobox pre-filled with detected IPs and default fallback
-#         self.host_e = ttk.Combobox(conn, values=detected_ips, state='normal', width=20)
-#         detected_ip, source = detect_local_ip_dynamic(self.preferred_iface)
-#         if detected_ip:
-#             self.host_e.set(detected_ip)
-#         else:
-#             self.host_e.set(DEFAULT_BROKER)
-#         self.host_e.grid(row=0, column=1, sticky="w")
-
-#         ttk.Label(conn, text="Port:").grid(row=0, column=2, sticky="w")
-#         self.port_e = ttk.Entry(conn, width=6)
-#         self.port_e.insert(0, str(DEFAULT_PORT))
-#         self.port_e.grid(row=0, column=3, sticky="w")
-
-#         # Refresh button to re-scan interfaces and update combobox values
-#         self.refresh_btn = ttk.Button(conn, text="Refresh IPs", command=self._refresh_ips)
-#         self.refresh_btn.grid(row=0, column=4, sticky="w", padx=6)
-
-#         self.status_label = ttk.Label(conn, text="Disconnected", foreground="red")
-#         self.status_label.grid(row=0, column=5, rowspan=2, sticky="e", padx=6)
-
-#         ttk.Label(conn, text="Topic:").grid(row=1, column=0, sticky="w")
-#         self.topic_e = ttk.Entry(conn)
-#         self.topic_e.insert(0, DEFAULT_TOPIC)
-#         self.topic_e.grid(row=1, column=1, columnspan=3, sticky="ew")
-
-#         ttk.Label(conn, text="User:").grid(row=2, column=0, sticky="w")
-#         self.user_e = ttk.Entry(conn)
-#         self.user_e.insert(0, DEFAULT_USER)
-#         self.user_e.grid(row=2, column=1, sticky="ew")
-
-#         ttk.Label(conn, text="Pass:").grid(row=2, column=2, sticky="w")
-#         self.pass_e = ttk.Entry(conn, show="*")
-#         self.pass_e.insert(0, DEFAULT_PASS)
-#         self.pass_e.grid(row=2, column=3, sticky="w")
-
-#         btn_frame = ttk.Frame(conn)
-#         btn_frame.grid(row=3, column=0, columnspan=6, sticky="ew", pady=(6, 0))
-#         self.connect_btn = ttk.Button(btn_frame, text="Connect", command=self.toggle_connect)
-#         self.connect_btn.pack(side="left")
-#         ttk.Button(btn_frame, text="Export CSV", command=self.export_csv).pack(side="left", padx=6)
-#         ttk.Button(btn_frame, text="Clear Data", command=self.clear_data).pack(side="left")
-
-#         # Readouts frame
-#         readouts = ttk.LabelFrame(frm, text="Current Readings")
-#         readouts.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
-#         readouts.columnconfigure(1, weight=1)
-
-#         ttk.Label(readouts, text="Temperature (°C):").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-#         self.temp_val = ttk.Label(readouts, text="—", font=("TkDefaultFont", 24))
-#         self.temp_val.grid(row=0, column=1, sticky="w", padx=6)
-
-#         ttk.Label(readouts, text="Humidity (%):").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-#         self.hum_val = ttk.Label(readouts, text="—", font=("TkDefaultFont", 24))
-#         self.hum_val.grid(row=1, column=1, sticky="w", padx=6)
-
-#         ttk.Label(readouts, text="Gas (raw):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
-#         self.gas_val = ttk.Label(readouts, text="—", font=("TkDefaultFont", 24))
-#         self.gas_val.grid(row=2, column=1, sticky="w", padx=6)
-
-#         self.log = tk.Text(frm, height=8, state="disabled", font=("Consolas", 10))
-#         self.log.grid(row=2, column=0, sticky="nsew", padx=4, pady=(4, 0))
-#         frm.rowconfigure(2, weight=0)
-
-#     def _refresh_ips(self):
-#         entries = get_all_ipv4_addresses()
-#         detected_ips = [ip for (_, ip) in entries]
-#         # update combobox values while keeping current text
-#         cur = self.host_e.get()
-#         self.host_e['values'] = detected_ips
-#         if not cur and detected_ips:
-#             self.host_e.set(detected_ips[0])
-
-#     def _build_plot(self):
-#         self.fig = Figure(figsize=(8, 3), dpi=100)
-#         self.ax = self.fig.add_subplot(111)
-#         self.ax.set_title("Last values (seconds)")
-#         self.ax.set_xlabel("Time (s ago)")
-#         self.ax.set_ylabel("Value")
-#         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
-#         self.canvas.get_tk_widget().grid(row=3, column=0, sticky="nsew", padx=8, pady=8)
-#         self.root.rowconfigure(3, weight=1)
-
-#     # ---------------- MQTT lifecycle ----------------
-#     def toggle_connect(self):
-#         if self.mqtt_client and self.connected:
-#             self._disconnect()
-#         else:
-#             self._connect()
-
-#     def _connect(self):
-#         host = self.host_e.get().strip()
-#         try:
-#             port = int(self.port_e.get().strip())
-#         except Exception:
-#             messagebox.showerror("Bad port", "Port must be integer")
-#             return
-#         topic = self.topic_e.get().strip()
-#         if not host or not topic:
-#             messagebox.showerror("Missing settings", "Host and Topic required")
-#             return
-
-#         if self.mqtt_client:
-#             try:
-#                 self.mqtt_client.disconnect()
-#             except:
-#                 pass
-#             try:
-#                 self.mqtt_client.loop_stop()
-#             except:
-#                 pass
-#             self.mqtt_client = None
-#             self.connected = False
-
-#         client_id = f"iot-frontend-{int(time.time())}"
-#         client = mqtt.Client(client_id=client_id, clean_session=True)
-
-#         user = self.user_e.get().strip()
-#         pwd = self.pass_e.get()
-#         if user:
-#             client.username_pw_set(user, pwd)
-
-#         client.on_connect = self._on_connect
-#         client.on_disconnect = self._on_disconnect
-#         client.on_message = self._on_message
-#         client.on_log = lambda cl, ud, level, buf: self.msg_q.put(("__LOG__", f"MQTT log [{level}]: {buf}", time.time()))
-
-#         try:
-#             client.connect(host, port, keepalive=60)
-#         except Exception as e:
-#             self.msg_q.put(("__SYS__", f"CONNECT FAILED: {e}", time.time()))
-#             messagebox.showerror("Connect failed", f"{e}")
-#             return
-
-#         try:
-#             client.loop_start()
-#         except Exception as e:
-#             self.msg_q.put(("__SYS__", f"LOOP_START FAILED: {e}", time.time()))
-#             messagebox.showerror("MQTT loop failed", f"{e}")
-#             return
-
-#         self.mqtt_client = client
-#         self.status_label.config(text="Connecting...", foreground="orange")
-#         self.connect_btn.config(text="Disconnect")
-#         self.msg_q.put(("__SYS__", "CONNECT_ISSUED", time.time()))
-
-#     def _disconnect(self):
-#         if self.mqtt_client:
-#             try:
-#                 self.mqtt_client.loop_stop()
-#             except:
-#                 pass
-#             try:
-#                 self.mqtt_client.disconnect()
-#             except:
-#                 pass
-#         self.mqtt_client = None
-#         self.connected = False
-#         self.status_label.config(text="Disconnected", foreground="red")
-#         self.connect_btn.config(text="Connect")
-#         self.msg_q.put(("__SYS__", "DISCONNECTED", time.time()))
-
-#     # MQTT callbacks and remaining methods unchanged (same as before)
-#     def _on_connect(self, client, userdata, flags, rc):
-#         topic = self.topic_e.get().strip()
-#         if rc == 0:
-#             try:
-#                 client.subscribe(topic)
-#                 self.msg_q.put(("__SYS__", f"SUBSCRIBED {topic}", time.time()))
-#             except Exception as e:
-#                 self.msg_q.put(("__SYS__", f"SUBSCRIBE FAILED {e}", time.time()))
-#             self.msg_q.put(("__SYS__", "CONNECTED", time.time()))
-#             self.connected = True
-#         else:
-#             self.msg_q.put(("__SYS__", f"CONNECT FAILED rc={rc}", time.time()))
-#             self.connected = False
-
-#     def _on_disconnect(self, client, userdata, rc):
-#         self.msg_q.put(("__SYS__", "DISCONNECTED", time.time()))
-#         self.connected = False
-
-#     def _on_message(self, client, userdata, msg):
-#         ts = time.time()
-#         try:
-#             payload = msg.payload.decode("utf-8", errors="replace")
-#         except Exception:
-#             payload = str(msg.payload)
-#         self.msg_q.put((msg.topic, payload, ts))
-
-#     def _poll_queue(self):
-#         updated = False
-#         while True:
-#             try:
-#                 topic, payload, ts = self.msg_q.get_nowait()
-#             except queue.Empty:
-#                 break
-
-#             if topic == "__SYS__":
-#                 self._append_log(ts, "SYS", payload)
-#                 if payload == "CONNECTED":
-#                     self.status_label.config(text="Connected", foreground="green")
-#                 elif payload.startswith("CONNECT FAILED"):
-#                     self.status_label.config(text="Connect failed", foreground="red")
-#                 elif payload == "DISCONNECTED":
-#                     self.status_label.config(text="Disconnected", foreground="red")
-#                 updated = True
-#                 continue
-
-#             if topic == "__LOG__":
-#                 self._append_log(ts, "MQTT-LOG", payload)
-#                 updated = True
-#                 continue
-
-#             self._append_log(ts, topic, payload)
-#             self.raw_log.append((ts, topic, payload))
-
-#             obj = None
-#             try:
-#                 obj = json.loads(payload)
-#             except Exception:
-#                 payload_sanitized = re.sub(r'(?<=:)\s*([-+]?(?:nan|inf|infinity))(?=[,}])', ' null', payload, flags=re.I)
-#                 try:
-#                     obj = json.loads(payload_sanitized)
-#                 except Exception:
-#                     obj = None
-
-#             if isinstance(obj, dict):
-#                 if "temperature" in obj:
-#                     tv = obj.get("temperature")
-#                     if tv is None:
-#                         self.temp_val.config(text="—")
-#                     else:
-#                         try:
-#                             t = float(tv)
-#                             if math.isnan(t):
-#                                 self.temp_val.config(text="—")
-#                             else:
-#                                 self.temp_val.config(text=f"{t:.1f} °C")
-#                                 self.temp_buf.append((ts, t))
-#                         except Exception:
-#                             self.temp_val.config(text="—")
-
-#                 if "humidity" in obj:
-#                     hv = obj.get("humidity")
-#                     if hv is None:
-#                         self.hum_val.config(text="—")
-#                     else:
-#                         try:
-#                             h = float(hv)
-#                             if math.isnan(h):
-#                                 self.hum_val.config(text="—")
-#                             else:
-#                                 self.hum_val.config(text=f"{h:.1f} %")
-#                                 self.hum_buf.append((ts, h))
-#                         except Exception:
-#                             self.hum_val.config(text="—")
-
-#                 if "gas_raw" in obj:
-#                     gv = obj.get("gas_raw")
-#                     if gv is None:
-#                         self.gas_val.config(text="—")
-#                     else:
-#                         try:
-#                             g = float(gv)
-#                             if math.isnan(g):
-#                                 self.gas_val.config(text="—")
-#                             else:
-#                                 self.gas_val.config(text=f"{int(round(g))}")
-#                                 self.gas_buf.append((ts, g))
-#                         except Exception:
-#                             self.gas_val.config(text="—")
-
-#                 updated = True
-#             else:
-#                 updated = True
-
-#         if updated:
-#             self._update_plot()
-#         self.root.after(POLL_MS, self._poll_queue)
-
-#     def _append_log(self, ts, topic, payload):
-#         timestr = time.strftime("%H:%M:%S", time.localtime(ts))
-#         line = f"[{timestr}] {topic}: {payload}\n"
-#         self.log.configure(state="normal")
-#         self.log.insert("end", line)
-#         self.log.yview_moveto(1.0)
-#         self.log.configure(state="disabled")
-
-#     def _update_plot(self):
-#         now = time.time()
-
-#         def series_to_xy(buf):
-#             if not buf:
-#                 return [], []
-#             xs = [now - t for (t, v) in buf]
-#             ys = [v for (t, v) in buf]
-#             return xs, ys
-
-#         tx, ty = series_to_xy(self.temp_buf)
-#         hx, hy = series_to_xy(self.hum_buf)
-#         gx, gy = series_to_xy(self.gas_buf)
-
-#         self.ax.cla()
-#         self.ax.invert_xaxis()
-#         if ty:
-#             self.ax.plot(tx, ty, label="Temp (°C)")
-#         if hy:
-#             self.ax.plot(hx, hy, label="Humidity (%)")
-#         if gy:
-#             self.ax.plot(gx, gy, label="Gas (raw)")
-#         self.ax.set_xlabel("Seconds ago")
-#         self.ax.set_title("Recent sensor history")
-#         self.ax.legend(loc="upper right")
-#         self.ax.relim()
-#         self.ax.autoscale_view()
-#         self.canvas.draw_idle()
-
-#     def export_csv(self):
-#         if not self.raw_log:
-#             messagebox.showinfo("No data", "No messages to export")
-#             return
-#         fn = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV file", "*.csv")])
-#         if not fn:
-#             return
-#         try:
-#             with open(fn, "w", newline="") as f:
-#                 w = csv.writer(f)
-#                 header = ["timestamp", "topic", "payload", "temperature", "humidity", "gas_raw"]
-#                 w.writerow(header)
-#                 for ts, topic, payload in self.raw_log:
-#                     temp = hum = gas = ""
-#                     try:
-#                         obj = json.loads(payload)
-#                         temp = obj.get("temperature", "")
-#                         hum = obj.get("humidity", "")
-#                         gas = obj.get("gas_raw", "")
-#                     except Exception:
-#                         payload_sanitized = re.sub(r'(?<=:)\s*([-+]?(?:nan|inf|infinity))(?=[,}])', ' null', payload, flags=re.I)
-#                         try:
-#                             obj = json.loads(payload_sanitized)
-#                             temp = obj.get("temperature", "")
-#                             hum = obj.get("humidity", "")
-#                             gas = obj.get("gas_raw", "")
-#                         except Exception:
-#                             pass
-#                     w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)), topic, payload, temp, hum, gas])
-#             messagebox.showinfo("Exported", f"Saved to {fn}")
-#         except Exception as e:
-#             messagebox.showerror("Export failed", str(e))
-
-#     def clear_data(self):
-#         self.temp_buf.clear()
-#         self.hum_buf.clear()
-#         self.gas_buf.clear()
-#         self.raw_log.clear()
-#         self.log.configure(state="normal")
-#         self.log.delete("1.0", "end")
-#         self.log.configure(state="disabled")
-#         self.temp_val.config(text="—")
-#         self.hum_val.config(text="—")
-#         self.gas_val.config(text="—")
-#         self._update_plot()
-
-#     def _on_close(self):
-#         try:
-#             if self.mqtt_client:
-#                 self.mqtt_client.loop_stop()
-#                 self.mqtt_client.disconnect()
-#         except:
-#             pass
-#         self.root.destroy()
-
-
-# if __name__ == "__main__":
-#     root = tk.Tk()
-#     app = IoTFrontend(root, preferred_iface='wlan0')
-#     root.geometry("900x700")
-#     root.mainloop()
-
 #!/usr/bin/env python3
-# iot_frontend.py
 """
-IoT frontend with dynamic local-IP detection and an editable Host combobox.
-Kept: MQTT key shortcuts (t/T/h/H) that publish to DEFAULT_CMD_TOPIC.
-Removed from UI: Cmd topic entry (functionality still present).
-Suppressed: successful command publish messages from appearing in the Tkinter log.
+IoT Air Sensor Dashboard
+- MQTT subscriber
+- Keyboard command publisher
+- 3 separate live graphs
+- SQLite database storage
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import time
-import json
-import queue
+import time, json, queue, csv, re, math
 from collections import deque
+import socket, subprocess, struct, fcntl
+import sqlite3
+
 import paho.mqtt.client as mqtt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import csv
-import re
-import math
-import socket
-import subprocess
-import struct
-import fcntl
 
-# ---------- CONFIG DEFAULTS ----------
+# ---------------- CONFIG ----------------
 DEFAULT_BROKER = "172.16.18.157"
 DEFAULT_PORT = 1883
 DEFAULT_TOPIC = "home/air/esp01/data"
-DEFAULT_CMD_TOPIC = "home/air/esp01/cmd"   # change here if you want a different cmd topic
+DEFAULT_CMD_TOPIC = "home/air/esp01/cmd"
 DEFAULT_USER = "esp01"
 DEFAULT_PASS = "pass"
-MAX_POINTS = 600   # keep last N points for plotting (~600)
-POLL_MS = 200      # GUI poll interval
 
-# default increment steps for keypress actions
+MAX_POINTS = 600
+POLL_MS = 200
+
 TEMP_STEP = 0.5
 HUM_STEP = 1.0
 # --------------------------------------
 
 
-def _get_ip_ioctl(ifname: str):
+# -------- IP DETECTION HELPERS --------
+def _get_ip_ioctl(ifname):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        ifname_b = ifname[:15].encode('utf-8')
-        packed = struct.pack('256s', ifname_b)
-        res = fcntl.ioctl(s.fileno(), 0x8915, packed)  # SIOCGIFADDR
-        ip = socket.inet_ntoa(res[20:24])
-        return ip
-    except Exception:
+        packed = struct.pack('256s', ifname[:15].encode())
+        res = fcntl.ioctl(s.fileno(), 0x8915, packed)
+        return socket.inet_ntoa(res[20:24])
+    except:
         return None
     finally:
-        try:
-            s.close()
-        except Exception:
-            pass
-
-
-def _get_ip_from_ip_cmd(ifname: str):
-    try:
-        p = subprocess.run(['ip', '-4', 'addr', 'show', ifname],
-                           capture_output=True, text=True, check=False, timeout=1.0)
-        out = p.stdout or ""
-        m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)/', out)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return None
-
-
-def _get_ip_via_socket():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
         s.close()
-        return ip
-    except Exception:
-        return None
 
 
 def get_all_ipv4_addresses():
-    """
-    Returns list of (iface, ip) tuples for all non-loopback IPv4 addresses.
-    Parses: `ip -4 -o addr show`
-    """
     try:
-        p = subprocess.run(['ip', '-4', '-o', 'addr', 'show'],
-                           capture_output=True, text=True, check=False, timeout=1.0)
-        out = p.stdout or ""
-        entries = re.findall(r'^\d+:\s+([^:]+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/', out, flags=re.M)
-        result = []
-        for iface, ip in entries:
-            if iface == 'lo':
-                continue
-            result.append((iface, ip))
-        return result
-    except Exception:
+        p = subprocess.run(
+            ['ip', '-4', '-o', 'addr', 'show'],
+            capture_output=True, text=True, timeout=1
+        )
+        return [(i, ip) for i, ip in
+                re.findall(r'\d+:\s+(\S+).*inet (\d+\.\d+\.\d+\.\d+)/', p.stdout)
+                if i != 'lo']
+    except:
         return []
 
 
-def detect_local_ip_dynamic(preferred_iface='wlan0'):
-    """
-    Tries preferred interface first (ioctl, ip cmd), otherwise scans all interfaces and returns first non-loopback.
-    Returns tuple (ip, source) where source is a short string describing how it was found.
-    """
-    try:
-        ip = _get_ip_ioctl(preferred_iface)
-        if ip:
-            return ip, f"ioctl:{preferred_iface}"
-    except Exception:
-        pass
-
-    ip = _get_ip_from_ip_cmd(preferred_iface)
+def detect_local_ip_dynamic(preferred='wlan0'):
+    ip = _get_ip_ioctl(preferred)
     if ip:
-        return ip, f"ipcmd:{preferred_iface}"
-
+        return ip
     entries = get_all_ipv4_addresses()
-    if entries:
-        for iface, addr in entries:
-            if iface == preferred_iface:
-                return addr, f"scan:{iface}"
-        iface, addr = entries[0]
-        return addr, f"scan:{iface}"
-
-    ip = _get_ip_via_socket()
-    if ip:
-        return ip, "socket:getter"
-
-    return None, "none"
+    return entries[0][1] if entries else DEFAULT_BROKER
+# --------------------------------------
 
 
 class IoTFrontend:
-    def __init__(self, root, preferred_iface='wlan0'):
+    def __init__(self, root):
         self.root = root
         root.title("Air Sensor Dashboard")
-        self.msg_q = queue.Queue()
-        self.preferred_iface = preferred_iface
 
-        # MQTT client and state
+        self.msg_q = queue.Queue()
         self.mqtt_client = None
         self.connected = False
 
-        # data buffers: deque of (ts, value)
         self.temp_buf = deque(maxlen=MAX_POINTS)
         self.hum_buf = deque(maxlen=MAX_POINTS)
         self.gas_buf = deque(maxlen=MAX_POINTS)
         self.raw_log = []
 
-        # command topic kept internal (no UI control shown)
-        self.cmd_topic = DEFAULT_CMD_TOPIC
+        # ---------- DATABASE ----------
+        self.db = sqlite3.connect("sensor_data.db", check_same_thread=False)
+        self.db_cursor = self.db.cursor()
+        self.db_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            topic TEXT,
+            temperature REAL,
+            humidity REAL,
+            gas_raw REAL,
+            payload TEXT
+        )
+        """)
+        self.db.commit()
 
         self._build_ui()
         self._build_plot()
 
-        # bind global keypresses
         self.root.bind("<Key>", self._on_keypress)
-
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(POLL_MS, self._poll_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # ---------------- UI ----------------
     def _build_ui(self):
-        frm = ttk.Frame(self.root, padding=8)
-        frm.grid(sticky="nsew")
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        frame = ttk.Frame(self.root, padding=8)
+        frame.grid(sticky="nsew")
 
-        conn = ttk.LabelFrame(frm, text="Broker / Subscription")
-        conn.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
-        for i in range(6):
-            conn.columnconfigure(i, weight=1 if i == 1 else 0)
+        # ---- Connection ----
+        conn = ttk.LabelFrame(frame, text="MQTT Connection")
+        conn.grid(row=0, column=0, sticky="ew")
 
-        ttk.Label(conn, text="Host:").grid(row=0, column=0, sticky="w")
-        entries = get_all_ipv4_addresses()  # list of (iface, ip)
-        detected_ips = [ip for (_, ip) in entries]
+        ttk.Label(conn, text="Host").grid(row=0, column=0)
+        ips = [ip for _, ip in get_all_ipv4_addresses()]
+        self.host_e = ttk.Combobox(conn, values=ips, width=18)
+        self.host_e.set(detect_local_ip_dynamic())
+        self.host_e.grid(row=0, column=1)
 
-        # Host editable Combobox pre-filled with detected IPs and default fallback
-        self.host_e = ttk.Combobox(conn, values=detected_ips, state='normal', width=20)
-        detected_ip, source = detect_local_ip_dynamic(self.preferred_iface)
-        if detected_ip:
-            self.host_e.set(detected_ip)
-        else:
-            self.host_e.set(DEFAULT_BROKER)
-        self.host_e.grid(row=0, column=1, sticky="w")
-
-        ttk.Label(conn, text="Port:").grid(row=0, column=2, sticky="w")
+        ttk.Label(conn, text="Port").grid(row=0, column=2)
         self.port_e = ttk.Entry(conn, width=6)
-        self.port_e.insert(0, str(DEFAULT_PORT))
-        self.port_e.grid(row=0, column=3, sticky="w")
+        self.port_e.insert(0, DEFAULT_PORT)
+        self.port_e.grid(row=0, column=3)
 
-        # Refresh button to re-scan interfaces and update combobox values
-        self.refresh_btn = ttk.Button(conn, text="Refresh IPs", command=self._refresh_ips)
-        self.refresh_btn.grid(row=0, column=4, sticky="w", padx=6)
-
-        self.status_label = ttk.Label(conn, text="Disconnected", foreground="red")
-        self.status_label.grid(row=0, column=5, rowspan=2, sticky="e", padx=6)
-
-        ttk.Label(conn, text="Topic:").grid(row=1, column=0, sticky="w")
-        self.topic_e = ttk.Entry(conn)
+        ttk.Label(conn, text="Topic").grid(row=1, column=0)
+        self.topic_e = ttk.Entry(conn, width=40)
         self.topic_e.insert(0, DEFAULT_TOPIC)
         self.topic_e.grid(row=1, column=1, columnspan=3, sticky="ew")
 
-        # NOTE: Cmd topic UI removed (functionality retained via self.cmd_topic)
-
-        ttk.Label(conn, text="User:").grid(row=2, column=0, sticky="w")
+        ttk.Label(conn, text="User").grid(row=2, column=0)
         self.user_e = ttk.Entry(conn)
         self.user_e.insert(0, DEFAULT_USER)
-        self.user_e.grid(row=2, column=1, sticky="ew")
+        self.user_e.grid(row=2, column=1)
 
-        ttk.Label(conn, text="Pass:").grid(row=2, column=2, sticky="w")
+        ttk.Label(conn, text="Pass").grid(row=2, column=2)
         self.pass_e = ttk.Entry(conn, show="*")
         self.pass_e.insert(0, DEFAULT_PASS)
-        self.pass_e.grid(row=2, column=3, sticky="w")
+        self.pass_e.grid(row=2, column=3)
 
-        btn_frame = ttk.Frame(conn)
-        btn_frame.grid(row=3, column=0, columnspan=6, sticky="ew", pady=(6, 0))
-        self.connect_btn = ttk.Button(btn_frame, text="Connect", command=self.toggle_connect)
-        self.connect_btn.pack(side="left")
-        ttk.Button(btn_frame, text="Export CSV", command=self.export_csv).pack(side="left", padx=6)
-        ttk.Button(btn_frame, text="Clear Data", command=self.clear_data).pack(side="left")
+        self.status = ttk.Label(conn, text="Disconnected", foreground="red")
+        self.status.grid(row=0, column=4, rowspan=2, padx=10)
 
-        # Readouts frame
-        readouts = ttk.LabelFrame(frm, text="Current Readings")
-        readouts.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
-        readouts.columnconfigure(1, weight=1)
+        ttk.Button(conn, text="Connect", command=self.toggle_connect).grid(row=3, column=0)
+        ttk.Button(conn, text="Export CSV", command=self.export_csv).grid(row=3, column=1)
+        ttk.Button(conn, text="Clear", command=self.clear_data).grid(row=3, column=2)
 
-        ttk.Label(readouts, text="Temperature (°C):").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        self.temp_val = ttk.Label(readouts, text="—", font=("TkDefaultFont", 24))
-        self.temp_val.grid(row=0, column=1, sticky="w", padx=6)
+        # ---- Readings ----
+        read = ttk.LabelFrame(frame, text="Current Readings")
+        read.grid(row=1, column=0, sticky="ew")
 
-        ttk.Label(readouts, text="Humidity (%):").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-        self.hum_val = ttk.Label(readouts, text="—", font=("TkDefaultFont", 24))
-        self.hum_val.grid(row=1, column=1, sticky="w", padx=6)
+        self.temp_val = ttk.Label(read, text="—", font=("Arial", 22))
+        self.hum_val = ttk.Label(read, text="—", font=("Arial", 22))
+        self.gas_val = ttk.Label(read, text="—", font=("Arial", 22))
 
-        ttk.Label(readouts, text="Gas (raw):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
-        self.gas_val = ttk.Label(readouts, text="—", font=("TkDefaultFont", 24))
-        self.gas_val.grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Label(read, text="Temp (°C)").grid(row=0, column=0)
+        ttk.Label(read, text="Humidity (%)").grid(row=1, column=0)
+        ttk.Label(read, text="Gas").grid(row=2, column=0)
 
-        self.log = tk.Text(frm, height=8, state="disabled", font=("Consolas", 10))
-        self.log.grid(row=2, column=0, sticky="nsew", padx=4, pady=(4, 0))
-        frm.rowconfigure(2, weight=0)
+        self.temp_val.grid(row=0, column=1)
+        self.hum_val.grid(row=1, column=1)
+        self.gas_val.grid(row=2, column=1)
 
-    def _refresh_ips(self):
-        entries = get_all_ipv4_addresses()
-        detected_ips = [ip for (_, ip) in entries]
-        cur = self.host_e.get()
-        self.host_e['values'] = detected_ips
-        if not cur and detected_ips:
-            self.host_e.set(detected_ips[0])
+        # ---- Log ----
+        self.log = tk.Text(frame, height=8, state="disabled")
+        self.log.grid(row=2, column=0, sticky="ew")
 
+    # ---------------- PLOT ----------------
     def _build_plot(self):
-        self.fig = Figure(figsize=(8, 3), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Last values (seconds)")
-        self.ax.set_xlabel("Time (s ago)")
-        self.ax.set_ylabel("Value")
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
-        self.canvas.get_tk_widget().grid(row=3, column=0, sticky="nsew", padx=8, pady=8)
-        self.root.rowconfigure(3, weight=1)
+        self.fig = Figure(figsize=(9, 6), dpi=100)
 
-    # ---------------- MQTT lifecycle ----------------
+        self.ax_t = self.fig.add_subplot(311)
+        self.ax_h = self.fig.add_subplot(312)
+        self.ax_g = self.fig.add_subplot(313)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, self.root)
+        self.canvas.get_tk_widget().grid(row=3, column=0, sticky="nsew")
+
+    def _update_plot(self):
+        now = time.time()
+
+        def xy(buf):
+            return [now - t for t, _ in buf], [v for _, v in buf]
+
+        for ax in (self.ax_t, self.ax_h, self.ax_g):
+            ax.cla()
+            ax.invert_xaxis()
+            ax.grid(True, alpha=0.3)
+
+        if self.temp_buf:
+            x, y = xy(self.temp_buf)
+            self.ax_t.plot(x, y)
+        self.ax_t.set_title("Temperature (°C)")
+
+        if self.hum_buf:
+            x, y = xy(self.hum_buf)
+            self.ax_h.plot(x, y)
+        self.ax_h.set_title("Humidity (%)")
+
+        if self.gas_buf:
+            x, y = xy(self.gas_buf)
+            self.ax_g.plot(x, y)
+        self.ax_g.set_title("Gas Sensor")
+
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    # ---------------- MQTT ----------------
     def toggle_connect(self):
-        if self.mqtt_client and self.connected:
+        if self.connected:
             self._disconnect()
         else:
             self._connect()
 
     def _connect(self):
-        host = self.host_e.get().strip()
-        try:
-            port = int(self.port_e.get().strip())
-        except Exception:
-            messagebox.showerror("Bad port", "Port must be integer")
-            return
-        topic = self.topic_e.get().strip()
-        if not host or not topic:
-            messagebox.showerror("Missing settings", "Host and Topic required")
-            return
-
-        if self.mqtt_client:
-            try:
-                self.mqtt_client.disconnect()
-            except:
-                pass
-            try:
-                self.mqtt_client.loop_stop()
-            except:
-                pass
-            self.mqtt_client = None
-            self.connected = False
-
-        client_id = f"iot-frontend-{int(time.time())}"
-        client = mqtt.Client(client_id=client_id, clean_session=True)
-
-        user = self.user_e.get().strip()
-        pwd = self.pass_e.get()
-        if user:
-            client.username_pw_set(user, pwd)
-
-        client.on_connect = self._on_connect
-        client.on_disconnect = self._on_disconnect
-        client.on_message = self._on_message
-        client.on_log = lambda cl, ud, level, buf: self.msg_q.put(("__LOG__", f"MQTT log [{level}]: {buf}", time.time()))
-
-        try:
-            client.connect(host, port, keepalive=60)
-        except Exception as e:
-            self.msg_q.put(("__SYS__", f"CONNECT FAILED: {e}", time.time()))
-            messagebox.showerror("Connect failed", f"{e}")
-            return
-
-        try:
-            client.loop_start()
-        except Exception as e:
-            self.msg_q.put(("__SYS__", f"LOOP_START FAILED: {e}", time.time()))
-            messagebox.showerror("MQTT loop failed", f"{e}")
-            return
-
-        self.mqtt_client = client
-        self.status_label.config(text="Connecting...", foreground="orange")
-        self.connect_btn.config(text="Disconnect")
-        self.msg_q.put(("__SYS__", "CONNECT_ISSUED", time.time()))
+        self.mqtt_client = mqtt.Client()
+        self.mqtt_client.username_pw_set(self.user_e.get(), self.pass_e.get())
+        self.mqtt_client.on_connect = self._on_connect
+        self.mqtt_client.on_message = self._on_message
+        self.mqtt_client.connect(self.host_e.get(), int(self.port_e.get()), 60)
+        self.mqtt_client.loop_start()
 
     def _disconnect(self):
-        if self.mqtt_client:
-            try:
-                self.mqtt_client.loop_stop()
-            except:
-                pass
-            try:
-                self.mqtt_client.disconnect()
-            except:
-                pass
-        self.mqtt_client = None
+        self.mqtt_client.loop_stop()
+        self.mqtt_client.disconnect()
         self.connected = False
-        self.status_label.config(text="Disconnected", foreground="red")
-        self.connect_btn.config(text="Connect")
-        self.msg_q.put(("__SYS__", "DISCONNECTED", time.time()))
+        self.status.config(text="Disconnected", foreground="red")
 
     def _on_connect(self, client, userdata, flags, rc):
-        topic = self.topic_e.get().strip()
-        if rc == 0:
-            try:
-                client.subscribe(topic)
-                self.msg_q.put(("__SYS__", f"SUBSCRIBED {topic}", time.time()))
-            except Exception as e:
-                self.msg_q.put(("__SYS__", f"SUBSCRIBE FAILED {e}", time.time()))
-            self.msg_q.put(("__SYS__", "CONNECTED", time.time()))
-            self.connected = True
-        else:
-            self.msg_q.put(("__SYS__", f"CONNECT FAILED rc={rc}", time.time()))
-            self.connected = False
-
-    def _on_disconnect(self, client, userdata, rc):
-        self.msg_q.put(("__SYS__", "DISCONNECTED", time.time()))
-        self.connected = False
+        client.subscribe(self.topic_e.get())
+        self.connected = True
+        self.status.config(text="Connected", foreground="green")
 
     def _on_message(self, client, userdata, msg):
-        ts = time.time()
-        try:
-            payload = msg.payload.decode("utf-8", errors="replace")
-        except Exception:
-            payload = str(msg.payload)
-        self.msg_q.put((msg.topic, payload, ts))
+        self.msg_q.put((time.time(), msg.topic, msg.payload.decode()))
 
-    # ---------------- Key handling & publishing ----------------
-    def _on_keypress(self, event):
-        """Handle global keypresses:
-           t -> temp increase, T -> temp decrease
-           h -> hum increase,  H -> hum decrease
-        """
-        ch = event.char
-        if not ch:
-            return  # ignore non-character keys
-
-        # use internal cmd_topic (no UI)
-        cmd_topic = self.cmd_topic or DEFAULT_CMD_TOPIC
-
-        if ch == 't':  # increase temperature
-            cmd = f"INC:{TEMP_STEP}"
-        elif ch == 'T':  # decrease temperature
-            cmd = f"DEC:{TEMP_STEP}"
-        elif ch == 'h':  # increase humidity
-            cmd = f"HUM_INC:{HUM_STEP}"
-        elif ch == 'H':  # decrease humidity
-            cmd = f"HUM_DEC:{HUM_STEP}"
-        else:
-            return  # not a key we care about
-
-        # publish; do NOT append a success log to the GUI (suppressed as requested)
-        ok = self._publish_cmd(cmd_topic, cmd)
-        if not ok:
-            # only show a warning if publish failed or we're disconnected
-            self._append_log(time.time(), "WARN", "Command not sent (disconnected or publish error)")
-
-    def _publish_cmd(self, topic, payload):
-        if not self.mqtt_client or not self.connected:
-            # small feedback to user (but not verbose success message)
-            return False
-        try:
-            self.mqtt_client.publish(topic, payload)
-            return True
-        except Exception as e:
-            # show error in GUI log
-            self._append_log(time.time(), "ERR", f"Publish failed: {e}")
-            return False
-
+    # ---------------- DATA ----------------
     def _poll_queue(self):
         updated = False
-        while True:
-            try:
-                topic, payload, ts = self.msg_q.get_nowait()
-            except queue.Empty:
-                break
+        while not self.msg_q.empty():
+            ts, topic, payload = self.msg_q.get()
+            self._log(topic, payload)
 
-            if topic == "__SYS__":
-                self._append_log(ts, "SYS", payload)
-                if payload == "CONNECTED":
-                    self.status_label.config(text="Connected", foreground="green")
-                elif payload.startswith("CONNECT FAILED"):
-                    self.status_label.config(text="Connect failed", foreground="red")
-                elif payload == "DISCONNECTED":
-                    self.status_label.config(text="Disconnected", foreground="red")
-                updated = True
-                continue
-
-            if topic == "__LOG__":
-                self._append_log(ts, "MQTT-LOG", payload)
-                updated = True
-                continue
-
-            # Received MQTT message — show it in log (but not command publishes)
-            self._append_log(ts, topic, payload)
-            self.raw_log.append((ts, topic, payload))
-
-            obj = None
             try:
                 obj = json.loads(payload)
-            except Exception:
-                payload_sanitized = re.sub(r'(?<=:)\s*([-+]?(?:nan|inf|infinity))(?=[,}])', ' null', payload, flags=re.I)
-                try:
-                    obj = json.loads(payload_sanitized)
-                except Exception:
-                    obj = None
+            except:
+                continue
 
-            if isinstance(obj, dict):
-                # only temperature, humidity, gas_raw are expected and handled
-                if "temperature" in obj:
-                    tv = obj.get("temperature")
-                    if tv is None:
-                        self.temp_val.config(text="—")
-                    else:
-                        try:
-                            t = float(tv)
-                            if math.isnan(t):
-                                self.temp_val.config(text="—")
-                            else:
-                                self.temp_val.config(text=f"{t:.1f} °C")
-                                self.temp_buf.append((ts, t))
-                        except Exception:
-                            self.temp_val.config(text="—")
+            t = obj.get("temperature")
+            h = obj.get("humidity")
+            g = obj.get("gas_raw")
 
-                if "humidity" in obj:
-                    hv = obj.get("humidity")
-                    if hv is None:
-                        self.hum_val.config(text="—")
-                    else:
-                        try:
-                            h = float(hv)
-                            if math.isnan(h):
-                                self.hum_val.config(text="—")
-                            else:
-                                self.hum_val.config(text=f"{h:.1f} %")
-                                self.hum_buf.append((ts, h))
-                        except Exception:
-                            self.hum_val.config(text="—")
+            if isinstance(t, (int, float)):
+                self.temp_buf.append((ts, t))
+                self.temp_val.config(text=f"{t:.1f}")
+            if isinstance(h, (int, float)):
+                self.hum_buf.append((ts, h))
+                self.hum_val.config(text=f"{h:.1f}")
+            if isinstance(g, (int, float)):
+                self.gas_buf.append((ts, g))
+                self.gas_val.config(text=str(int(g)))
 
-                if "gas_raw" in obj:
-                    gv = obj.get("gas_raw")
-                    if gv is None:
-                        self.gas_val.config(text="—")
-                    else:
-                        try:
-                            g = float(gv)
-                            if math.isnan(g):
-                                self.gas_val.config(text="—")
-                            else:
-                                self.gas_val.config(text=f"{int(round(g))}")
-                                self.gas_buf.append((ts, g))
-                        except Exception:
-                            self.gas_val.config(text="—")
+            self.db_cursor.execute(
+                "INSERT INTO readings VALUES (NULL,?,?,?,?,?,?)",
+                (time.strftime("%F %T", time.localtime(ts)), topic, t, h, g, payload)
+            )
+            self.db.commit()
 
-                updated = True
-            else:
-                updated = True
+            updated = True
 
         if updated:
             self._update_plot()
+
         self.root.after(POLL_MS, self._poll_queue)
 
-    def _append_log(self, ts, topic, payload):
-        timestr = time.strftime("%H:%M:%S", time.localtime(ts))
-        line = f"[{timestr}] {topic}: {payload}\n"
-        self.log.configure(state="normal")
-        self.log.insert("end", line)
-        self.log.yview_moveto(1.0)
-        self.log.configure(state="disabled")
-
-    def _update_plot(self):
-        now = time.time()
-
-        def series_to_xy(buf):
-            if not buf:
-                return [], []
-            xs = [now - t for (t, v) in buf]
-            ys = [v for (t, v) in buf]
-            return xs, ys
-
-        tx, ty = series_to_xy(self.temp_buf)
-        hx, hy = series_to_xy(self.hum_buf)
-        gx, gy = series_to_xy(self.gas_buf)
-
-        self.ax.cla()
-        self.ax.invert_xaxis()
-        if ty:
-            self.ax.plot(tx, ty, label="Temp (°C)")
-        if hy:
-            self.ax.plot(hx, hy, label="Humidity (%)")
-        if gy:
-            self.ax.plot(gx, gy, label="Gas (raw)")
-        self.ax.set_xlabel("Seconds ago")
-        self.ax.set_title("Recent sensor history")
-        self.ax.legend(loc="upper right")
-        self.ax.relim()
-        self.ax.autoscale_view()
-        self.canvas.draw_idle()
-
-    def export_csv(self):
-        if not self.raw_log:
-            messagebox.showinfo("No data", "No messages to export")
+    # ---------------- KEYS ----------------
+    def _on_keypress(self, e):
+        if not self.connected:
             return
-        fn = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV file", "*.csv")])
+
+        if e.char == 't':
+            self.mqtt_client.publish(DEFAULT_CMD_TOPIC, f"INC:{TEMP_STEP}")
+        elif e.char == 'T':
+            self.mqtt_client.publish(DEFAULT_CMD_TOPIC, f"DEC:{TEMP_STEP}")
+        elif e.char == 'h':
+            self.mqtt_client.publish(DEFAULT_CMD_TOPIC, f"HUM_INC:{HUM_STEP}")
+        elif e.char == 'H':
+            self.mqtt_client.publish(DEFAULT_CMD_TOPIC, f"HUM_DEC:{HUM_STEP}")
+
+    # ---------------- UTIL ----------------
+    def export_csv(self):
+        fn = filedialog.asksaveasfilename(defaultextension=".csv")
         if not fn:
             return
-        try:
-            with open(fn, "w", newline="") as f:
-                w = csv.writer(f)
-                header = ["timestamp", "topic", "payload", "temperature", "humidity", "gas_raw"]
-                w.writerow(header)
-                for ts, topic, payload in self.raw_log:
-                    temp = hum = gas = ""
-                    try:
-                        obj = json.loads(payload)
-                        temp = obj.get("temperature", "")
-                        hum = obj.get("humidity", "")
-                        gas = obj.get("gas_raw", "")
-                    except Exception:
-                        payload_sanitized = re.sub(r'(?<=:)\s*([-+]?(?:nan|inf|infinity))(?=[,}])', ' null', payload, flags=re.I)
-                        try:
-                            obj = json.loads(payload_sanitized)
-                            temp = obj.get("temperature", "")
-                            hum = obj.get("humidity", "")
-                            gas = obj.get("gas_raw", "")
-                        except Exception:
-                            pass
-                    w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)), topic, payload, temp, hum, gas])
-            messagebox.showinfo("Exported", f"Saved to {fn}")
-        except Exception as e:
-            messagebox.showerror("Export failed", str(e))
+        rows = self.db_cursor.execute("SELECT * FROM readings").fetchall()
+        with open(fn, "w", newline="") as f:
+            csv.writer(f).writerows(rows)
 
     def clear_data(self):
         self.temp_buf.clear()
         self.hum_buf.clear()
         self.gas_buf.clear()
-        self.raw_log.clear()
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
-        self.temp_val.config(text="—")
-        self.hum_val.config(text="—")
-        self.gas_val.config(text="—")
         self._update_plot()
+
+    def _log(self, topic, msg):
+        self.log.config(state="normal")
+        self.log.insert("end", f"[{topic}] {msg}\n")
+        self.log.yview_moveto(1)
+        self.log.config(state="disabled")
 
     def _on_close(self):
         try:
-            if self.mqtt_client:
-                self.mqtt_client.loop_stop()
-                self.mqtt_client.disconnect()
+            self.db.close()
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
         except:
             pass
         self.root.destroy()
 
 
+# ---------------- RUN ----------------
 if __name__ == "__main__":
     root = tk.Tk()
-    app = IoTFrontend(root, preferred_iface='wlan0')
-    root.geometry("900x700")
+    root.geometry("950x750")
+    app = IoTFrontend(root)
     root.mainloop()
